@@ -1,0 +1,59 @@
+name: 'Silicon RP2040 Register Checker'
+description: 'Verifies RP2040 firmware register/bitfield usage against the SVD ground truth, catching invalid or hallucinated register values before flash.'
+inputs:
+  paths:
+    description: 'Firmware files or directories to check (space-separated).'
+    required: true
+  svd:
+    description: 'Path to a CMSIS-SVD file to check against. Defaults to the vendored RP2040 SVD.'
+    required: false
+    default: ''
+  fail-on:
+    description: 'Minimum severity that fails the job: error, warning, or none.'
+    required: false
+    default: 'error'
+  upload-sarif:
+    description: 'Whether to upload SARIF results for GitHub code scanning.'
+    required: false
+    default: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build silicon
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: cargo build --release --manifest-path "$ACTION_PATH/../Cargo.toml" -p silicon-cli
+
+    - name: Generate SARIF report
+      if: ${{ inputs.upload-sarif == 'true' }}
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        PATHS: ${{ inputs.paths }}
+        SVD: ${{ inputs.svd }}
+      run: |
+        SVD_ARG=()
+        if [ -n "$SVD" ]; then SVD_ARG=(--svd "$SVD"); fi
+        "$ACTION_PATH/../target/release/silicon" --format sarif --fail-on none --output silicon-results.sarif "${SVD_ARG[@]}" $PATHS
+
+    - name: Upload SARIF
+      if: ${{ inputs.upload-sarif == 'true' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: silicon-results.sarif
+
+    - name: Check firmware
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        PATHS: ${{ inputs.paths }}
+        SVD: ${{ inputs.svd }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        SVD_ARG=()
+        if [ -n "$SVD" ]; then SVD_ARG=(--svd "$SVD"); fi
+        "$ACTION_PATH/../target/release/silicon" --fail-on "$FAIL_ON" "${SVD_ARG[@]}" $PATHS

@@ -2,7 +2,7 @@
 //! checker flags exactly that line with the SVD citation, and produces ZERO
 //! findings on the known-correct equivalent.
 
-use checker::{check, FindingKind};
+use checker::{check, FindingKind, Severity};
 use fw_parse::extract_accesses;
 use svd_model::Model;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,7 @@ fn hallucinated_clock_auxsrc_flags_exactly_that_line() {
     );
     let f = &result.findings[0];
     assert_eq!(f.line, 14);
+    assert_eq!(f.severity, Severity::Error);
     match &f.kind {
         FindingKind::FieldValueNotInEnum { peripheral, register, field, value, allowed } => {
             assert_eq!(peripheral, "CLOCKS");
@@ -83,6 +84,7 @@ fn hallucinated_pll_fbdiv_too_wide_flags_exactly_that_line() {
     );
     let f = &result.findings[0];
     assert_eq!(f.line, 16);
+    assert_eq!(f.severity, Severity::Warning);
     match &f.kind {
         FindingKind::ValueSetsUndefinedBits { peripheral, register, value, defined_mask } => {
             assert_eq!(peripheral, "PLL_SYS");

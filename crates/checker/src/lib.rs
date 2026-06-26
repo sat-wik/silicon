@@ -52,12 +52,100 @@ pub enum FindingKind {
     },
 }
 
+/// How confident a finding is. Every variant is already conservative (see
+/// CLAUDE.md invariant 2 — uncertain cases are `Note`s, not findings at any
+/// severity), but some violation classes are unambiguous bugs (`Error`)
+/// while others rest on a CMSIS access annotation whose real-world effect
+/// the spec itself calls "undefined" (`Warning`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Warning,
+    Error,
+}
+
+impl FindingKind {
+    pub fn severity(&self) -> Severity {
+        match self {
+            FindingKind::NonexistentRegister { .. }
+            | FindingKind::AddressNotARegister { .. }
+            | FindingKind::ValueExceedsRegisterWidth { .. }
+            | FindingKind::FieldValueNotInEnum { .. }
+            | FindingKind::WriteToReadOnlyRegister { .. } => Severity::Error,
+            FindingKind::ValueSetsUndefinedBits { .. } | FindingKind::WriteToReadOnlyField { .. } => {
+                Severity::Warning
+            }
+        }
+    }
+
+    /// Stable identifier for this violation class — used as the SARIF rule
+    /// id. Never changes meaning for a given variant; safe to key tooling on.
+    pub fn rule_id(&self) -> &'static str {
+        match self {
+            FindingKind::NonexistentRegister { .. } => "nonexistent-register",
+            FindingKind::AddressNotARegister { .. } => "address-not-a-register",
+            FindingKind::ValueExceedsRegisterWidth { .. } => "value-exceeds-register-width",
+            FindingKind::ValueSetsUndefinedBits { .. } => "value-sets-undefined-bits",
+            FindingKind::FieldValueNotInEnum { .. } => "field-value-not-in-enum",
+            FindingKind::WriteToReadOnlyRegister { .. } => "write-to-read-only-register",
+            FindingKind::WriteToReadOnlyField { .. } => "write-to-read-only-field",
+        }
+    }
+}
+
+impl std::fmt::Display for FindingKind {
+    /// A plain-language explanation that embeds the SVD citation backing
+    /// it (peripheral/register/field, allowed values, address) — every
+    /// finding must be traceable to a parsed SVD fact, so the explanation
+    /// and the citation are the same data, not two separate stories.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FindingKind::NonexistentRegister { peripheral, register } => write!(
+                f,
+                "{peripheral}.{register} is not a register defined in the SVD for {peripheral}"
+            ),
+            FindingKind::AddressNotARegister { peripheral, address } => write!(
+                f,
+                "address 0x{address:08x} falls inside {peripheral}'s address block but matches no register's start address in the SVD"
+            ),
+            FindingKind::ValueExceedsRegisterWidth { peripheral, register, value, size_bits } => write!(
+                f,
+                "value 0x{value:x} written to {peripheral}.{register} does not fit in its {size_bits}-bit width"
+            ),
+            FindingKind::ValueSetsUndefinedBits { peripheral, register, value, defined_mask } => write!(
+                f,
+                "value 0x{value:x} written to {peripheral}.{register} sets bits outside the fields the SVD defines for it (defined bits: 0x{defined_mask:x})"
+            ),
+            FindingKind::FieldValueNotInEnum { peripheral, register, field, value, allowed } => {
+                let allowed_str = allowed
+                    .iter()
+                    .map(|v| format!("{}={}", v.name, v.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "value {value} written to {peripheral}.{register}.{field} is not one of the SVD's allowed values: {allowed_str}"
+                )
+            }
+            FindingKind::WriteToReadOnlyRegister { peripheral, register } => write!(
+                f,
+                "{peripheral}.{register} is read-only in the SVD, but firmware writes to it"
+            ),
+            FindingKind::WriteToReadOnlyField { peripheral, register, field } => write!(
+                f,
+                "{peripheral}.{register}.{field} is read-only in the SVD, but firmware sets bits within it"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub kind: FindingKind,
+    pub severity: Severity,
     pub file: PathBuf,
     pub line: usize,
     pub raw_lhs: String,
+    pub raw_op: &'static str,
     pub raw_rhs: String,
 }
 
@@ -87,6 +175,34 @@ pub enum Note {
     /// determinable resulting value without knowing the prior register
     /// contents, so value-dependent checks were skipped for this access.
     ValueNotDeterminableForOp { peripheral: String, register: String },
+}
+
+impl std::fmt::Display for Note {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Note::UnresolvedAccess => write!(f, "access target is not statically determinable"),
+            Note::UnknownPeripheralGuess { peripheral } => {
+                write!(f, "no SVD peripheral named {peripheral}; likely not a register access")
+            }
+            Note::PeripheralOnlyKnown { peripheral } => {
+                write!(f, "peripheral {peripheral} resolved, but no register name was determinable")
+            }
+            Note::AddressNotMapped { address } => {
+                write!(f, "address 0x{address:08x} is not within any peripheral's address block")
+            }
+            Note::FieldUnverifiableNoEnum { peripheral, register, field } => write!(
+                f,
+                "{peripheral}.{register}.{field} has no enumerated values in the SVD; value membership is unverifiable"
+            ),
+            Note::RegisterHasNoFields { peripheral, register } => {
+                write!(f, "{peripheral}.{register} has no fields defined in the SVD; bit-level checks skipped")
+            }
+            Note::ValueNotDeterminableForOp { peripheral, register } => write!(
+                f,
+                "the resulting value written to {peripheral}.{register} isn't statically determinable for this operator"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,13 +435,32 @@ fn field_mask(field: &FieldModel) -> u64 {
 }
 
 fn finding(result: &mut CheckResult, access: &RegisterAccess, kind: FindingKind) {
+    let severity = kind.severity();
     result.findings.push(Finding {
         kind,
+        severity,
         file: access.file.clone(),
         line: access.line,
         raw_lhs: access.raw_lhs.clone(),
+        raw_op: op_text(access.op),
         raw_rhs: access.raw_rhs.clone(),
     });
+}
+
+fn op_text(op: AssignOp) -> &'static str {
+    match op {
+        AssignOp::Assign => "=",
+        AssignOp::OrAssign => "|=",
+        AssignOp::AndAssign => "&=",
+        AssignOp::XorAssign => "^=",
+        AssignOp::AddAssign => "+=",
+        AssignOp::SubAssign => "-=",
+        AssignOp::MulAssign => "*=",
+        AssignOp::DivAssign => "/=",
+        AssignOp::ModAssign => "%=",
+        AssignOp::ShlAssign => "<<=",
+        AssignOp::ShrAssign => ">>=",
+    }
 }
 
 fn note(result: &mut CheckResult, access: &RegisterAccess, note: Note) {
@@ -452,5 +587,15 @@ mod tests {
             Note::FieldUnverifiableNoEnum { peripheral, register, field }
                 if peripheral == "PLL_SYS" && register == "FBDIV_INT" && field == "FBDIV_INT"
         )));
+    }
+
+    #[test]
+    fn finding_kind_display_cites_svd_facts() {
+        let model = rp2040_model();
+        let result = check_src(&model, "void f(void) { clocks_hw->clk_gpout0_ctrl = 12u << 5; }");
+        let text = result.findings[0].kind.to_string();
+        assert!(text.contains("CLOCKS.CLK_GPOUT0_CTRL.AUXSRC"));
+        assert!(text.contains("clksrc_pll_sys=0"));
+        assert_eq!(result.findings[0].kind.rule_id(), "field-value-not-in-enum");
     }
 }

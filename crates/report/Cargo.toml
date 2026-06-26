@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 checker = { path = "../checker" }
+serde_json = "1"
+
+[dev-dependencies]
+fw-parse = { path = "../fw-parse" }
+svd-model = { path = "../svd-model" }
