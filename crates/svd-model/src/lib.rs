@@ -21,6 +21,23 @@ pub struct PeripheralModel {
     pub name: String,
     pub base_address: u64,
     pub registers: Vec<RegisterModel>,
+    /// (offset, size) pairs from the SVD `addressBlock` elements, relative
+    /// to `base_address`. Used to tell "address lands in this peripheral's
+    /// space but on no defined register" apart from "address is unrelated
+    /// to any peripheral" — only the former is evidence of a real bug.
+    address_blocks: Vec<(u32, u32)>,
+}
+
+/// Result of resolving an absolute address against the SVD address map.
+#[derive(Debug, Clone, Copy)]
+pub enum AddressLookup<'m> {
+    /// The address is exactly a known register's start address.
+    Register(&'m PeripheralModel, &'m RegisterModel),
+    /// The address falls inside a peripheral's address block, but doesn't
+    /// match any defined register's start address.
+    WithinPeripheral(&'m PeripheralModel),
+    /// The address isn't covered by any peripheral in the SVD at all.
+    Unmapped,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +63,7 @@ pub struct FieldModel {
     pub allowed_values: Option<Vec<EnumValue>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumValue {
     pub name: String,
     pub value: u64,
@@ -90,6 +107,28 @@ impl Model {
         &self.peripherals
     }
 
+    /// Resolves an absolute address against the SVD address map. See
+    /// [`AddressLookup`] for what each outcome means.
+    pub fn resolve_address(&self, addr: u64) -> AddressLookup<'_> {
+        for p in &self.peripherals {
+            for r in &p.registers {
+                if p.base_address + r.address_offset as u64 == addr {
+                    return AddressLookup::Register(p, r);
+                }
+            }
+        }
+        for p in &self.peripherals {
+            for (offset, size) in &p.address_blocks {
+                let start = p.base_address + *offset as u64;
+                let end = start + *size as u64;
+                if addr >= start && addr < end {
+                    return AddressLookup::WithinPeripheral(p);
+                }
+            }
+        }
+        AddressLookup::Unmapped
+    }
+
     fn from_device(device: &svd_parser::svd::Device) -> Model {
         let peripherals: Vec<PeripheralModel> = device
             .peripherals
@@ -113,10 +152,18 @@ impl PeripheralModel {
                 collect_registers(rc, 0, &mut registers);
             }
         }
+        let address_blocks = p
+            .address_block
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|b| (b.offset, b.size))
+            .collect();
         PeripheralModel {
             name: p.name.clone(),
             base_address: p.base_address,
             registers,
+            address_blocks,
         }
     }
 }
@@ -280,5 +327,34 @@ mod tests {
         assert!(model.peripheral("NOT_A_PERIPHERAL").is_none());
         assert!(model.register("SIO", "NOT_A_REGISTER").is_none());
         assert!(model.field("SIO", "GPIO_OE", "NOT_A_FIELD").is_none());
+    }
+
+    #[test]
+    fn resolve_address_finds_exact_register() {
+        let model = rp2040_model();
+        // PLL_SYS base 0x40028000, FBDIV_INT register at offset 0x08.
+        match model.resolve_address(0x40028008) {
+            AddressLookup::Register(p, r) => {
+                assert_eq!(p.name, "PLL_SYS");
+                assert_eq!(r.name, "FBDIV_INT");
+            }
+            other => panic!("expected exact register match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_address_within_peripheral_but_no_register() {
+        let model = rp2040_model();
+        // Inside PLL_SYS's address block, but not aligned to a defined register.
+        match model.resolve_address(0x40028001) {
+            AddressLookup::WithinPeripheral(p) => assert_eq!(p.name, "PLL_SYS"),
+            other => panic!("expected within-peripheral match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_address_unmapped() {
+        let model = rp2040_model();
+        assert!(matches!(model.resolve_address(0xffff_ffff), AddressLookup::Unmapped));
     }
 }
