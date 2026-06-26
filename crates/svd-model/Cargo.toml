@@ -1,0 +1,11 @@
+[package]
+name = "svd-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+svd-parser = { version = "0.14", features = ["expand"] }
+svd-rs = "0.14"
+thiserror = "1"
+anyhow = "1"

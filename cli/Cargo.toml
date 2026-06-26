@@ -1,0 +1,15 @@
+[package]
+name = "silicon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "silicon"
+path = "src/main.rs"
+
+[dependencies]
+svd-model = { path = "../crates/svd-model" }
+fw-parse = { path = "../crates/fw-parse" }
+checker = { path = "../crates/checker" }
+report = { path = "../crates/report" }
