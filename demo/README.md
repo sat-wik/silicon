@@ -55,3 +55,18 @@ toggle `SIO.GPIO_OUT` in a loop.
 
 5. Compare what you observed against the prediction. If it matches, the
    static finding from step 1 has been confirmed on real silicon.
+
+## Result (confirmed 2026-07-01)
+
+Both predictions held on a real Raspberry Pi Pico:
+
+| Firmware | Static finding | Observed behavior |
+|---|---|---|
+| `blink_correct.uf2` | none | LED blinks ~1 Hz ✓ |
+| `blink_hallucinated.uf2` | `error[field-value-not-in-enum]` IO_BANK0.GPIO25_CTRL.FUNCSEL=0 | LED stays off ✓ |
+
+The tool caught the register bug statically before the board was touched.
+Flashing the buggy firmware then reproduced the predicted failure on real
+silicon: setting `FUNCSEL=0` (not a valid SIO function-select value for
+GPIO25) silently disconnects the SIO peripheral from the physical pin, so
+every `GPIO_OUT` toggle in the firmware loop has no effect on the LED.
