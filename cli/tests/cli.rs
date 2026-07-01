@@ -44,7 +44,7 @@ fn correct_firmware_exits_zero_with_zero_findings() {
     let output = run(&[path.to_str().unwrap()]);
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("0 error(s), 0 warning(s)"));
+    assert!(stdout.contains("no findings"));
 }
 
 #[test]

@@ -105,6 +105,78 @@ impl FindingKind {
             FindingKind::HalCallFuncselNotInEnum { .. } => "hal-call-funcsel-not-in-enum",
         }
     }
+
+    /// Short headline used by the terminal renderer — no long enum lists.
+    pub fn title(&self) -> String {
+        match self {
+            FindingKind::NonexistentRegister { peripheral, register } =>
+                format!("{peripheral}.{register} — not a register in the SVD"),
+            FindingKind::AddressNotARegister { peripheral, address } =>
+                format!("0x{address:08x} is inside {peripheral}'s block but matches no register"),
+            FindingKind::ValueExceedsRegisterWidth { peripheral, register, value, size_bits } =>
+                format!("{peripheral}.{register} — value 0x{value:x} doesn't fit in {size_bits} bits"),
+            FindingKind::ValueSetsUndefinedBits { peripheral, register, value, .. } =>
+                format!("{peripheral}.{register} — value 0x{value:x} sets bits outside all defined fields"),
+            FindingKind::FieldValueNotInEnum { peripheral, register, field, value, .. } =>
+                format!("{peripheral}.{register}.{field} — value {value} not in SVD enum"),
+            FindingKind::WriteToReadOnlyRegister { peripheral, register } =>
+                format!("{peripheral}.{register} — read-only register written"),
+            FindingKind::WriteToReadOnlyField { peripheral, register, field } =>
+                format!("{peripheral}.{register}.{field} — read-only field written"),
+            FindingKind::HalCallPinOutOfRange { function, pin } =>
+                format!("{function}(GPIO{pin}) — pin doesn't exist (RP2040 has GPIO0..GPIO29)"),
+            FindingKind::HalCallFuncselNotInEnum { pin, func, .. } =>
+                format!("gpio_set_function(GPIO{pin}, {func}) — func not in SVD enum"),
+        }
+    }
+
+    /// The SVD evidence block shown below the source excerpt. `None` when the
+    /// title already carries all the relevant facts.
+    pub fn citation(&self) -> Option<String> {
+        match self {
+            FindingKind::ValueExceedsRegisterWidth { peripheral, register, size_bits, .. } => {
+                let max = if *size_bits < 64 { (1u64 << size_bits) - 1 } else { u64::MAX };
+                Some(format!("SVD: {peripheral}.{register} — {size_bits}-bit register (max 0x{max:x})"))
+            }
+            FindingKind::ValueSetsUndefinedBits { peripheral, register, defined_mask, .. } =>
+                Some(format!("SVD: {peripheral}.{register} — defined bits: 0x{defined_mask:08x}")),
+            FindingKind::FieldValueNotInEnum { peripheral, register, field, allowed, .. } =>
+                Some(format!("SVD: {peripheral}.{register}.{field}\n     allowed: {}",
+                    fmt_enum_list(allowed))),
+            FindingKind::WriteToReadOnlyRegister { peripheral, register } =>
+                Some(format!("SVD: {peripheral}.{register} — access = read-only")),
+            FindingKind::WriteToReadOnlyField { peripheral, register, field } =>
+                Some(format!("SVD: {peripheral}.{register}.{field} — access = read-only")),
+            FindingKind::HalCallFuncselNotInEnum { pin, allowed, .. } =>
+                Some(format!("SVD: IO_BANK0.GPIO{pin}_CTRL.FUNCSEL\n     allowed: {}",
+                    fmt_enum_list(allowed))),
+            _ => None,
+        }
+    }
+}
+
+fn fmt_enum_list(allowed: &[crate::EnumValue]) -> String {
+    const LINE_WIDTH: usize = 72;
+    // 14 spaces — aligns continuation lines with the first entry in
+    // "     allowed: X, Y, Z" for the typical 2-digit line number width.
+    const INDENT: &str = "              ";
+    let mut out = String::new();
+    let mut col = 0usize;
+    for (i, v) in allowed.iter().enumerate() {
+        let entry = format!("{}={}", v.name, v.value);
+        let sep = if i == 0 { "" } else { ", " };
+        if col > 0 && col + sep.len() + entry.len() > LINE_WIDTH {
+            out.push('\n');
+            out.push_str(INDENT);
+            col = 0;
+        } else {
+            out.push_str(sep);
+            col += sep.len();
+        }
+        out.push_str(&entry);
+        col += entry.len();
+    }
+    out
 }
 
 impl std::fmt::Display for FindingKind {

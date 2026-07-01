@@ -1,13 +1,11 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
-use checker::{Noted, Severity};
+use checker::Severity;
 use clap::Parser;
 
-/// Vendored RP2040 SVD, embedded at build time so the binary works
-/// out-of-the-box with no config — see CLAUDE.md's "single static binary"
-/// stack decision. `--svd` overrides it.
 const VENDORED_RP2040_SVD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../data/rp2040.svd"));
 
 #[derive(Parser)]
@@ -36,20 +34,17 @@ struct Args {
     /// Also print informational notes (unresolved accesses, unverifiable fields, etc).
     #[arg(long)]
     notes: bool,
+
+    /// Disable colour output (auto-disabled when stdout is not a terminal).
+    #[arg(long)]
+    no_color: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum Format {
-    Text,
-    Sarif,
-}
+enum Format { Text, Sarif }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum FailOn {
-    Error,
-    Warning,
-    None,
-}
+enum FailOn { Error, Warning, None }
 
 fn main() -> ExitCode {
     let args = Args::parse();
@@ -63,10 +58,12 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> anyhow::Result<ExitCode> {
+    // Color: on by default when writing to a terminal, off otherwise.
+    let color = !args.no_color && args.output.is_none() && std::io::stdout().is_terminal();
+
     let svd_xml = match &args.svd {
-        Some(path) => {
-            std::fs::read_to_string(path).with_context(|| format!("reading SVD file {}", path.display()))?
-        }
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading SVD file {}", path.display()))?,
         None => VENDORED_RP2040_SVD.to_string(),
     };
     let model = svd_model::Model::from_svd_str(&svd_xml).context("parsing SVD")?;
@@ -83,7 +80,8 @@ fn run(args: &Args) -> anyhow::Result<ExitCode> {
     let mut accesses = Vec::new();
     let mut hal_calls = Vec::new();
     for file in &files {
-        let source = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let source = std::fs::read_to_string(file)
+            .with_context(|| format!("reading {}", file.display()))?;
         accesses.extend(fw_parse::extract_accesses(&source, file));
         hal_calls.extend(fw_parse::extract_hal_calls(&source, file));
     }
@@ -93,22 +91,20 @@ fn run(args: &Args) -> anyhow::Result<ExitCode> {
     let mut result = reg_result;
     result.findings.extend(hal_result.findings);
     result.notes.extend(hal_result.notes);
-    // Sort by file then line so the report is deterministic regardless of
-    // which tier detected each issue first.
     result.findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     result.notes.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
     let report_text = match args.format {
         Format::Text => {
-            let mut s = report::render_text(&result.findings);
+            let mut s = report::render_text(&result.findings, &result.notes, color);
             if args.notes {
-                s.push('\n');
-                s.push_str(&render_notes(&result.notes));
+                s.push_str(&report::render_notes_text(&result.notes, color));
             }
             s
         }
-        Format::Sarif => serde_json::to_string_pretty(&report::render_sarif(&result.findings, &result.notes))
-            .context("serializing SARIF")?,
+        Format::Sarif => serde_json::to_string_pretty(
+            &report::render_sarif(&result.findings, &result.notes)
+        ).context("serializing SARIF")?,
     };
 
     match &args.output {
@@ -138,12 +134,4 @@ fn collect_c_files(path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
         out.push(path.to_path_buf());
     }
     Ok(())
-}
-
-fn render_notes(notes: &[Noted]) -> String {
-    let mut s = String::from("notes:\n");
-    for n in notes {
-        s.push_str(&format!("  {}:{}: {}\n", n.file.display(), n.line, n.note));
-    }
-    s
 }
