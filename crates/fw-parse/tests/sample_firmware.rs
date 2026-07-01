@@ -58,10 +58,15 @@ fn lists_every_access_and_marks_unresolved_ones() {
     let resolved_count = accesses.len() - unresolved.len();
     assert_eq!(resolved_count, 8, "the other 8 accesses must resolve a peripheral/register name or address");
 
-    // Spot-check one of each tier resolved correctly.
-    assert!(accesses.iter().any(|a| a.target
-        == Target::RegsMacro { peripheral: "PLL_SYS".into(), register: Some("FBDIV_INT".into()) }));
+    // PLL_SYS_BASE and PLL_SYS_FBDIV_INT_OFFSET are both #define'd with numeric
+    // literals in sample_pll_gpio.c, so macro folding now resolves the BASE+OFFSET
+    // expression to a concrete address rather than a symbolic RegsMacro target —
+    // more precise for the checker's address-lookup path.
+    assert!(accesses.iter().any(|a| a.target == Target::Address(0x40028008)),
+        "PLL_SYS_BASE+PLL_SYS_FBDIV_INT_OFFSET must fold to Address(0x40028008)");
+    // Struct-tier access is still symbolically resolved as before.
     assert!(accesses.iter().any(|a| a.target
         == Target::StructField { peripheral: "PLL_SYS".into(), register: "FBDIV_INT".into() }));
+    // Literal-only raw-pointer address still works.
     assert!(accesses.iter().any(|a| a.target == Target::Address(0x40028000)));
 }

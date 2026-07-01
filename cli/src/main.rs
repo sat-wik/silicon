@@ -81,12 +81,22 @@ fn run(args: &Args) -> anyhow::Result<ExitCode> {
     }
 
     let mut accesses = Vec::new();
+    let mut hal_calls = Vec::new();
     for file in &files {
         let source = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         accesses.extend(fw_parse::extract_accesses(&source, file));
+        hal_calls.extend(fw_parse::extract_hal_calls(&source, file));
     }
 
-    let result = checker::check(&model, &accesses);
+    let reg_result = checker::check(&model, &accesses);
+    let hal_result = checker::check_hal_calls(&model, &hal_calls);
+    let mut result = reg_result;
+    result.findings.extend(hal_result.findings);
+    result.notes.extend(hal_result.notes);
+    // Sort by file then line so the report is deterministic regardless of
+    // which tier detected each issue first.
+    result.findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    result.notes.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
     let report_text = match args.format {
         Format::Text => {
@@ -97,7 +107,7 @@ fn run(args: &Args) -> anyhow::Result<ExitCode> {
             }
             s
         }
-        Format::Sarif => serde_json::to_string_pretty(&report::render_sarif(&result.findings))
+        Format::Sarif => serde_json::to_string_pretty(&report::render_sarif(&result.findings, &result.notes))
             .context("serializing SARIF")?,
     };
 

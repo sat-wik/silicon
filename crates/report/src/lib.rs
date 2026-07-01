@@ -4,7 +4,7 @@
 //! id, citation) already exists on the `Finding`; this crate decides
 //! nothing about correctness (CLAUDE.md invariant 1).
 
-use checker::{Finding, Severity};
+use checker::{Finding, Noted, Severity};
 
 /// Human-readable terminal report: one block per finding, file/line,
 /// offending expression, and the SVD-grounded plain-language explanation,
@@ -33,17 +33,24 @@ pub fn render_text(findings: &[Finding]) -> String {
     out
 }
 
-/// A minimal SARIF 2.1.0 document. Severity maps to SARIF `level`
-/// (`Error` -> "error", `Warning` -> "warning"); `rule_id()` is used
-/// verbatim as both the rule id and (for now) the rule's short description.
-pub fn render_sarif(findings: &[Finding]) -> serde_json::Value {
-    let rule_ids: std::collections::BTreeSet<&str> = findings.iter().map(|f| f.kind.rule_id()).collect();
+/// A minimal SARIF 2.1.0 document.
+///
+/// Findings emit as `error` or `warning` results. Notes emit as `note`-level
+/// informational results so they appear in code-scanning UIs alongside findings
+/// without causing CI to fail — the distinction between "violation" and
+/// "unverifiable" stays visible without conflating the two.
+pub fn render_sarif(findings: &[Finding], notes: &[Noted]) -> serde_json::Value {
+    let mut rule_ids: std::collections::BTreeSet<&str> =
+        findings.iter().map(|f| f.kind.rule_id()).collect();
+    if !notes.is_empty() {
+        rule_ids.insert("note");
+    }
     let rules: Vec<serde_json::Value> = rule_ids
         .into_iter()
         .map(|id| serde_json::json!({ "id": id }))
         .collect();
 
-    let results: Vec<serde_json::Value> = findings
+    let mut results: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
             serde_json::json!({
@@ -62,6 +69,21 @@ pub fn render_sarif(findings: &[Finding]) -> serde_json::Value {
             })
         })
         .collect();
+
+    for n in notes {
+        results.push(serde_json::json!({
+            "ruleId": "note",
+            "kind": "informational",
+            "level": "note",
+            "message": { "text": n.note.to_string() },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": n.file.to_string_lossy() },
+                    "region": { "startLine": n.line }
+                }
+            }]
+        }));
+    }
 
     serde_json::json!({
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -118,7 +140,7 @@ mod tests {
     #[test]
     fn render_sarif_has_matching_rule_and_result() {
         let findings = findings_for("void f(void) { clocks_hw->clk_gpout0_ctrl = 12u << 5; }");
-        let sarif = render_sarif(&findings);
+        let sarif = render_sarif(&findings, &[]);
         assert_eq!(sarif["version"], "2.1.0");
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r["id"] == "field-value-not-in-enum"));
@@ -133,7 +155,29 @@ mod tests {
     fn render_sarif_maps_warning_severity() {
         let findings = findings_for("void f(void) { pll_sys_hw->fbdiv_int = 5000; }");
         assert_eq!(findings[0].kind.severity(), checker::Severity::Warning);
-        let sarif = render_sarif(&findings);
+        let sarif = render_sarif(&findings, &[]);
         assert_eq!(sarif["runs"][0]["results"][0]["level"], "warning");
+    }
+
+    #[test]
+    fn render_sarif_includes_notes_as_informational() {
+        let model = rp2040_model();
+        let accesses = fw_parse::extract_accesses(
+            "void f(void) { pll_sys_hw->fbdiv_int = 100; }",
+            std::path::Path::new("test.c"),
+        );
+        let result = checker::check(&model, &accesses);
+        assert!(!result.notes.is_empty(), "FBDIV_INT has no enum so must produce notes");
+        let sarif = render_sarif(&result.findings, &result.notes);
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        // Zero findings but at least one note result.
+        assert!(result.findings.is_empty());
+        let note_results: Vec<_> = results.iter().filter(|r| r["level"] == "note").collect();
+        assert!(!note_results.is_empty());
+        assert_eq!(note_results[0]["kind"], "informational");
+        assert_eq!(note_results[0]["ruleId"], "note");
+        // "note" rule must appear in the driver's rules list.
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["id"] == "note"));
     }
 }

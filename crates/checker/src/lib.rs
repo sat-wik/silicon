@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use fw_parse::{AssignOp, RegisterAccess, Target};
+use fw_parse::{AssignOp, HalCall, RegisterAccess, Target};
 use svd_model::{Access, AddressLookup, EnumValue, FieldModel, Model, PeripheralModel, RegisterModel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,17 @@ pub enum FindingKind {
         register: String,
         field: String,
     },
+    // ── Phase B: HAL-call tier ────────────────────────────────────────────
+    /// A Pico SDK gpio_* call's pin argument is outside the RP2040's
+    /// GPIO range (0–29).
+    HalCallPinOutOfRange { function: String, pin: u64 },
+    /// gpio_set_function's `fn` argument is not one of the SVD's enumerated
+    /// FUNCSEL values for the given pin.
+    HalCallFuncselNotInEnum {
+        pin: u64,
+        func: u64,
+        allowed: Vec<EnumValue>,
+    },
 }
 
 /// How confident a finding is. Every variant is already conservative (see
@@ -70,7 +81,9 @@ impl FindingKind {
             | FindingKind::AddressNotARegister { .. }
             | FindingKind::ValueExceedsRegisterWidth { .. }
             | FindingKind::FieldValueNotInEnum { .. }
-            | FindingKind::WriteToReadOnlyRegister { .. } => Severity::Error,
+            | FindingKind::WriteToReadOnlyRegister { .. }
+            | FindingKind::HalCallPinOutOfRange { .. }
+            | FindingKind::HalCallFuncselNotInEnum { .. } => Severity::Error,
             FindingKind::ValueSetsUndefinedBits { .. } | FindingKind::WriteToReadOnlyField { .. } => {
                 Severity::Warning
             }
@@ -88,6 +101,8 @@ impl FindingKind {
             FindingKind::FieldValueNotInEnum { .. } => "field-value-not-in-enum",
             FindingKind::WriteToReadOnlyRegister { .. } => "write-to-read-only-register",
             FindingKind::WriteToReadOnlyField { .. } => "write-to-read-only-field",
+            FindingKind::HalCallPinOutOfRange { .. } => "hal-call-pin-out-of-range",
+            FindingKind::HalCallFuncselNotInEnum { .. } => "hal-call-funcsel-not-in-enum",
         }
     }
 }
@@ -134,6 +149,21 @@ impl std::fmt::Display for FindingKind {
                 f,
                 "{peripheral}.{register}.{field} is read-only in the SVD, but firmware sets bits within it"
             ),
+            FindingKind::HalCallPinOutOfRange { function, pin } => write!(
+                f,
+                "{function}: pin {pin} is out of range — the RP2040 has GPIO0..GPIO29"
+            ),
+            FindingKind::HalCallFuncselNotInEnum { pin, func, allowed } => {
+                let allowed_str = allowed
+                    .iter()
+                    .map(|v| format!("{}={}", v.name, v.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "gpio_set_function: func value {func} is not a valid FUNCSEL for GPIO{pin} — SVD IO_BANK0.GPIO{pin}_CTRL.FUNCSEL allows: {allowed_str}"
+                )
+            }
         }
     }
 }
@@ -175,6 +205,9 @@ pub enum Note {
     /// determinable resulting value without knowing the prior register
     /// contents, so value-dependent checks were skipped for this access.
     ValueNotDeterminableForOp { peripheral: String, register: String },
+    /// A HAL-call argument isn't a statically-known constant, so the check
+    /// that depends on it was skipped rather than guessed.
+    HalCallArgUnknown { function: String, arg_index: usize },
 }
 
 impl std::fmt::Display for Note {
@@ -200,6 +233,10 @@ impl std::fmt::Display for Note {
             Note::ValueNotDeterminableForOp { peripheral, register } => write!(
                 f,
                 "the resulting value written to {peripheral}.{register} isn't statically determinable for this operator"
+            ),
+            Note::HalCallArgUnknown { function, arg_index } => write!(
+                f,
+                "{function}: argument {arg_index} isn't a compile-time constant — check skipped"
             ),
         }
     }
@@ -471,6 +508,99 @@ fn note(result: &mut CheckResult, access: &RegisterAccess, note: Note) {
     });
 }
 
+// ── Phase B: HAL-call tier ────────────────────────────────────────────────
+
+const RP2040_GPIO_COUNT: u64 = 30; // GPIO0..GPIO29
+
+/// Checks Pico SDK HAL calls against the SVD model.
+///
+/// - `gpio_set_function(pin, func)`: pin in 0..29, func in FUNCSEL enum for that pin.
+/// - `gpio_init(pin)`, `gpio_put(pin, value)`, `gpio_set_dir(pin, dir)`: pin in 0..29.
+pub fn check_hal_calls(model: &Model, calls: &[HalCall]) -> CheckResult {
+    let mut result = CheckResult::default();
+    for call in calls {
+        check_hal_one(model, call, &mut result);
+    }
+    result
+}
+
+fn check_hal_one(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    match call.function.as_str() {
+        "gpio_set_function" => check_gpio_set_function(model, call, result),
+        "gpio_init" | "gpio_put" | "gpio_set_dir" => check_gpio_pin_range(call, result),
+        _ => {}
+    }
+}
+
+fn check_gpio_pin_range(call: &HalCall, result: &mut CheckResult) {
+    match call.args.first() {
+        Some(Some(pin)) if *pin >= RP2040_GPIO_COUNT => {
+            hal_finding(result, call, FindingKind::HalCallPinOutOfRange {
+                function: call.function.clone(),
+                pin: *pin,
+            });
+        }
+        Some(None) => hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(),
+            arg_index: 0,
+        }),
+        _ => {}
+    }
+}
+
+fn check_gpio_set_function(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    let pin = match call.args.first() {
+        Some(Some(p)) => *p,
+        Some(None) => return hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(), arg_index: 0,
+        }),
+        None => return,
+    };
+    if pin >= RP2040_GPIO_COUNT {
+        return hal_finding(result, call, FindingKind::HalCallPinOutOfRange {
+            function: call.function.clone(), pin,
+        });
+    }
+    let func = match call.args.get(1) {
+        Some(Some(f)) => *f,
+        Some(None) => return hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(), arg_index: 1,
+        }),
+        None => return,
+    };
+    let reg_name = format!("GPIO{pin}_CTRL");
+    let Some(reg) = model.register("IO_BANK0", &reg_name) else { return };
+    let Some(funcsel_field) = reg.fields.iter().find(|f| f.name == "FUNCSEL") else { return };
+    let Some(allowed) = &funcsel_field.allowed_values else { return };
+    if !allowed.iter().any(|v| v.value == func) {
+        hal_finding(result, call, FindingKind::HalCallFuncselNotInEnum {
+            pin, func, allowed: allowed.clone(),
+        });
+    }
+}
+
+fn hal_finding(result: &mut CheckResult, call: &HalCall, kind: FindingKind) {
+    let severity = kind.severity();
+    let raw_lhs = format!("{}({})", call.function, call.raw_args.join(", "));
+    result.findings.push(Finding {
+        kind,
+        severity,
+        file: call.file.clone(),
+        line: call.line,
+        raw_lhs,
+        raw_op: "",
+        raw_rhs: String::new(),
+    });
+}
+
+fn hal_note(result: &mut CheckResult, call: &HalCall, note: Note) {
+    result.notes.push(Noted {
+        note,
+        file: call.file.clone(),
+        line: call.line,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +717,72 @@ mod tests {
             Note::FieldUnverifiableNoEnum { peripheral, register, field }
                 if peripheral == "PLL_SYS" && register == "FBDIV_INT" && field == "FBDIV_INT"
         )));
+    }
+
+    // ── Phase B tests ──────────────────────────────────────────────────────
+
+    fn hal_check(model: &Model, src: &str) -> CheckResult {
+        let calls = fw_parse::extract_hal_calls(src, Path::new("test.c"));
+        check_hal_calls(model, &calls)
+    }
+
+    #[test]
+    fn gpio_set_function_valid_funcsel_passes() {
+        let model = rp2040_model();
+        // sio_25 = 5 is valid for GPIO25 per the SVD.
+        let result = hal_check(&model, "void f(void) { gpio_set_function(25, 5); }");
+        assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn gpio_set_function_invalid_funcsel_is_flagged() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { gpio_set_function(25, 99); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallFuncselNotInEnum { pin, func, allowed } => {
+                assert_eq!(*pin, 25);
+                assert_eq!(*func, 99);
+                assert_eq!(allowed.len(), 10);
+            }
+            other => panic!("expected HalCallFuncselNotInEnum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpio_init_pin_out_of_range_is_flagged() {
+        let model = rp2040_model();
+        // RP2040 has GPIO0..GPIO29; GPIO30 doesn't exist.
+        let result = hal_check(&model, "void f(void) { gpio_init(30); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallPinOutOfRange { function, pin } => {
+                assert_eq!(function, "gpio_init");
+                assert_eq!(*pin, 30);
+            }
+            other => panic!("expected HalCallPinOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpio_set_function_unknown_pin_produces_note_not_finding() {
+        let model = rp2040_model();
+        // Runtime pin variable: can't statically check.
+        let result = hal_check(&model, "void f(uint pin) { gpio_set_function(pin, 5); }");
+        assert!(result.findings.is_empty());
+        assert!(result.notes.iter().any(|n| matches!(
+            &n.note, Note::HalCallArgUnknown { function, arg_index }
+                if function == "gpio_set_function" && *arg_index == 0
+        )));
+    }
+
+    #[test]
+    fn gpio_set_function_macro_funcsel_is_resolved_and_checked() {
+        let model = rp2040_model();
+        // GPIO_FUNC_NULL = 0x1f (31) is a valid FUNCSEL value (null function).
+        let src = "#define GPIO_FUNC_NULL 31u\nvoid f(void) { gpio_set_function(0, GPIO_FUNC_NULL); }";
+        let result = hal_check(&model, src);
+        assert!(result.findings.is_empty(), "GPIO_FUNC_NULL=31 is valid: {:?}", result.findings);
     }
 
     #[test]

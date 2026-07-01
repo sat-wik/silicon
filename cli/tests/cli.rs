@@ -65,7 +65,10 @@ fn sarif_format_is_valid_json_with_a_result() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
     assert_eq!(json["version"], "2.1.0");
-    assert_eq!(json["runs"][0]["results"].as_array().unwrap().len(), 1);
+    let results = json["runs"][0]["results"].as_array().unwrap();
+    // SARIF now includes both findings (error/warning) and notes (informational).
+    let error_results: Vec<_> = results.iter().filter(|r| r["level"] == "error").collect();
+    assert_eq!(error_results.len(), 1, "expected exactly one error-level result");
 }
 
 #[test]
