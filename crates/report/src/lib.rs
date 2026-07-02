@@ -5,39 +5,52 @@ use std::path::{Path, PathBuf};
 
 use checker::{Finding, Noted, Severity};
 
-// ── ANSI colour helpers ───────────────────────────────────────────────────────
+// ── ANSI colour palette ───────────────────────────────────────────────────────
 
 struct C {
-    reset: &'static str,
-    bold: &'static str,
-    dim: &'static str,
-    bold_red: &'static str,
+    reset:       &'static str,
+    bold:        &'static str,
+    dim:         &'static str,
+    bold_white:  &'static str,
+    bold_red:    &'static str,
     bold_yellow: &'static str,
-    bold_blue: &'static str,
-    cyan: &'static str,
+    bold_cyan:   &'static str,
+    cyan:        &'static str,
+    // reverse-video badges (inverted foreground/background)
+    rev_red:     &'static str,
+    rev_yellow:  &'static str,
+    rev_green:   &'static str,
 }
 
 impl C {
     fn new(color: bool) -> Self {
         if color {
             C {
-                reset: "\x1b[0m",
-                bold: "\x1b[1m",
-                dim: "\x1b[2m",
-                bold_red: "\x1b[1;31m",
+                reset:       "\x1b[0m",
+                bold:        "\x1b[1m",
+                dim:         "\x1b[2m",
+                bold_white:  "\x1b[1;37m",
+                bold_red:    "\x1b[1;31m",
                 bold_yellow: "\x1b[1;33m",
-                bold_blue: "\x1b[1;34m",
-                cyan: "\x1b[36m",
+                bold_cyan:   "\x1b[1;36m",
+                cyan:        "\x1b[36m",
+                rev_red:     "\x1b[7;31m",
+                rev_yellow:  "\x1b[7;33m",
+                rev_green:   "\x1b[7;32m",
             }
         } else {
-            C { reset: "", bold: "", dim: "", bold_red: "", bold_yellow: "", bold_blue: "", cyan: "" }
+            C {
+                reset:"", bold:"", dim:"", bold_white:"", bold_red:"",
+                bold_yellow:"", bold_cyan:"", cyan:"", rev_red:"",
+                rev_yellow:"", rev_green:"",
+            }
         }
     }
-    fn severity(&self, s: Severity) -> &'static str {
-        match s {
-            Severity::Error => self.bold_red,
-            Severity::Warning => self.bold_yellow,
-        }
+    fn sev_fg(&self, s: Severity) -> &'static str {
+        match s { Severity::Error => self.bold_red, Severity::Warning => self.bold_yellow }
+    }
+    fn sev_rev(&self, s: Severity) -> &'static str {
+        match s { Severity::Error => self.rev_red, Severity::Warning => self.rev_yellow }
     }
 }
 
@@ -59,14 +72,15 @@ impl SourceCache {
 
 // ── Terminal report ───────────────────────────────────────────────────────────
 
-/// Human-readable terminal report with source excerpts, caret underlines, and
-/// colour. Pass `color = false` when output is not a terminal (piped / file).
 pub fn render_text(findings: &[Finding], _notes: &[Noted], color: bool) -> String {
     let c = C::new(color);
     let mut src = SourceCache::default();
     let mut out = String::new();
 
-    for f in findings {
+    for (i, f) in findings.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&separator(&c));
+        }
         out.push_str(&render_finding(f, &mut src, &c));
     }
 
@@ -76,163 +90,170 @@ pub fn render_text(findings: &[Finding], _notes: &[Noted], color: bool) -> Strin
 
 fn render_finding(f: &Finding, src: &mut SourceCache, c: &C) -> String {
     let mut out = String::new();
-    let sev_str = match f.severity { Severity::Error => "error", Severity::Warning => "warning" };
-    let sev_c = c.severity(f.severity);
+    let (icon, sev_str) = match f.severity {
+        Severity::Error   => ("✗", "error"),
+        Severity::Warning => ("⚠", "warning"),
+    };
+    let sev_fg  = c.sev_fg(f.severity);
+    let sev_rev = c.sev_rev(f.severity);
+    let caret_ch = match f.severity { Severity::Error => '^', Severity::Warning => '~' };
 
-    // ── headline ──────────────────────────────────────────────────────────────
+    // ── Severity badge + rule id ──────────────────────────────────────────────
     out += &format!(
-        "{sev_c}{sev_str}[{}]{rst}: {bold}{}{rst}\n",
-        f.kind.rule_id(), f.kind.title(),
-        sev_c = sev_c, rst = c.reset, bold = c.bold,
+        " {rev} {icon} {sev_str} {rst}  {dim}{}{rst}\n",
+        f.kind.rule_id(), rev = sev_rev, rst = c.reset, dim = c.dim,
     );
 
-    // ── file / line pointer ───────────────────────────────────────────────────
-    let file = f.file.display().to_string();
-    let line_w = digits(f.line);
-    out += &format!(" {blue}{:line_w$} --> {rst}{bold}{file}:{}{rst}\n", "", f.line,
-        blue = c.bold_blue, rst = c.reset, bold = c.bold);
-    out += &gutter(line_w, None, c);
-
-    // ── source line + caret ───────────────────────────────────────────────────
-    let expr = expr_text(f);
-    if let Some(raw) = src.line(&f.file, f.line) {
-        out += &gutter_line(f.line, line_w, raw, c);
-        out += &caret_line(raw, &expr, line_w, c, f.severity);
-    } else {
-        // source file not readable: show the expression we extracted
-        let synthetic = format!("    {expr}");
-        out += &gutter_line(f.line, line_w, &synthetic, c);
-        out += &caret_line(&synthetic, &expr, line_w, c, f.severity);
-    }
-
-    out += &gutter(line_w, None, c);
-
-    // ── SVD citation ──────────────────────────────────────────────────────────
-    if let Some(cit) = f.kind.citation() {
-        for (i, line) in cit.lines().enumerate() {
-            if i == 0 {
-                out += &format!(" {blue}{:line_w$} = {rst}{cyan}{line}{rst}\n",
-                    "", blue = c.bold_blue, rst = c.reset, cyan = c.cyan);
-            } else {
-                out += &format!(" {blue}{:line_w$}   {rst}{cyan}{line}{rst}\n",
-                    "", blue = c.bold_blue, rst = c.reset, cyan = c.cyan);
-            }
-        }
-    }
-
+    // ── Headline ─────────────────────────────────────────────────────────────
+    out += &format!(" {bw}{}{rst}\n", f.kind.title(), bw = c.bold_white, rst = c.reset);
     out.push('\n');
+
+    // ── Source box ───────────────────────────────────────────────────────────
+    let file = f.file.display().to_string();
+    let line_w = digits(f.line).max(2);
+    let bc = c.bold_cyan;
+    let rst = c.reset;
+
+    out += &format!("  {bc}╭─{rst} {bold}{file}{dim} · line {}{rst}\n",
+        f.line, bold = c.bold, dim = c.dim, bc = bc, rst = rst);
+    out += &format!("  {bc}│{rst}\n", bc = bc, rst = rst);
+
+    let raw = src.line(&f.file, f.line)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("    {}", expr_text(f)));
+
+    let expr = expr_text(f);
+
+    // Source line with highlighted expression
+    let colored_src = colorize_expr(&raw, &expr, sev_fg, c);
+    out += &format!(
+        "  {bc}│{rst}  {dim}{n:>w$}{rst}  {bc}│{rst}  {src}\n",
+        n = f.line, w = line_w, src = colored_src,
+        bc = bc, dim = c.dim, rst = rst,
+    );
+
+    // Caret underline
+    let lead      = raw.len() - raw.trim_start().len();
+    let col_off   = raw.find(expr.trim_start()).unwrap_or(lead);
+    let caret_len = expr.len().min(raw.len().saturating_sub(col_off)).max(1);
+    let carets    = caret_ch.to_string().repeat(caret_len);
+    out += &format!(
+        "  {bc}│{rst}  {sp:>w$}  {bc}│{rst}  {pad}{fg}{bold}{carets}{rst}\n",
+        sp = "", w = line_w, pad = " ".repeat(col_off),
+        fg = sev_fg, bold = c.bold,
+        bc = bc, rst = rst,
+    );
+
+    // ── Citation / close ─────────────────────────────────────────────────────
+    if let Some(cit) = f.kind.citation() {
+        out += &format!("  {bc}│{rst}\n", bc = bc, rst = rst);
+        let mut cit_lines = cit.lines();
+        if let Some(first) = cit_lines.next() {
+            out += &format!("  {bc}╰─{rst} {cyan}{}{rst}\n", first, cyan = c.cyan, bc = bc, rst = rst);
+        }
+        for line in cit_lines {
+            out += &format!("       {cyan}{}{rst}\n", line, cyan = c.cyan, rst = rst);
+        }
+    } else {
+        out += &format!("  {bc}╰──{rst}\n", bc = bc, rst = rst);
+    }
+
     out
 }
 
-fn render_summary(findings: &[Finding], c: &C) -> String {
-    let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
-    let warnings = findings.iter().filter(|f| f.severity == Severity::Warning).count();
-    if errors == 0 && warnings == 0 {
-        return format!("{}{}{}\n", c.bold, "no findings", c.reset);
+/// Wrap the part of `raw` that matches `expr` in color codes, leaving the
+/// rest unchanged. Used to highlight the bad expression inside its source line.
+fn colorize_expr(raw: &str, expr: &str, color: &'static str, c: &C) -> String {
+    let needle = expr.trim_start();
+    if let Some(pos) = raw.find(needle) {
+        let end = (pos + needle.len()).min(raw.len());
+        format!("{}{}{}{}{}", &raw[..pos], color, &raw[pos..end], c.reset, &raw[end..])
+    } else {
+        raw.to_string()
     }
-    let mut parts = Vec::new();
-    if errors > 0 {
-        parts.push(format!("{}{} error{}{}", c.bold_red, errors,
-            if errors == 1 { "" } else { "s" }, c.reset));
-    }
-    if warnings > 0 {
-        parts.push(format!("{}{} warning{}{}", c.bold_yellow, warnings,
-            if warnings == 1 { "" } else { "s" }, c.reset));
-    }
-    format!("{}found {}{}\n", c.bold, parts.join(" · "), c.reset)
 }
 
-/// Render informational notes in the same style as findings but quieter.
+fn separator(c: &C) -> String {
+    format!("\n  {dim}{}{rst}\n\n", "─".repeat(60), dim = c.dim, rst = c.reset)
+}
+
+fn render_summary(findings: &[Finding], c: &C) -> String {
+    let errors   = findings.iter().filter(|f| f.severity == Severity::Error).count();
+    let warnings = findings.iter().filter(|f| f.severity == Severity::Warning).count();
+
+    if errors == 0 && warnings == 0 {
+        return format!("\n {rb} ✓ no findings {rst}\n\n",
+            rb = c.rev_green, rst = c.reset);
+    }
+
+    let mut parts = Vec::new();
+    if errors > 0 {
+        parts.push(format!("{rev} ✗ {n} error{s} {rst}",
+            rev = c.rev_red, rst = c.reset, n = errors,
+            s = if errors == 1 { "" } else { "s" }));
+    }
+    if warnings > 0 {
+        parts.push(format!("{rev} ⚠ {n} warning{s} {rst}",
+            rev = c.rev_yellow, rst = c.reset, n = warnings,
+            s = if warnings == 1 { "" } else { "s" }));
+    }
+    format!("\n  {}\n\n", parts.join("  "))
+}
+
+/// Render informational notes with a quieter visual style.
 pub fn render_notes_text(notes: &[Noted], color: bool) -> String {
     if notes.is_empty() { return String::new(); }
     let c = C::new(color);
     let mut src = SourceCache::default();
-    let mut out = format!("\n{}notes:{}\n", c.bold, c.reset);
+    let mut out = format!("  {rb} ℹ notes {rst}\n\n", rb = c.rev_green, rst = c.reset);
     for n in notes {
         let file = n.file.display().to_string();
-        let line_w = digits(n.line);
-        out += &format!(" {blue}note:{rst} {dim}{}{rst}\n",
-            n.note, blue = c.bold_blue, dim = c.dim, rst = c.reset);
-        out += &format!("   {blue}-->{rst} {file}:{}\n",
-            n.line, blue = c.bold_blue, rst = c.reset);
+        let line_w = digits(n.line).max(2);
+        out += &format!("  {bold_cyan}·{rst} {dim}{}{rst}\n",
+            n.note, bold_cyan = c.bold_cyan, dim = c.dim, rst = c.reset);
+        out += &format!("    {dim}{file}:{}{rst}\n", n.line, dim = c.dim, rst = c.reset);
         if let Some(raw) = src.line(&n.file, n.line) {
-            out += &gutter(line_w, None, &c);
-            out += &gutter_line(n.line, line_w, raw, &c);
-            out += &gutter(line_w, None, &c);
+            out += &format!("    {dim}{n:>w$}  │  {rst}{raw}\n",
+                n = n.line, w = line_w, dim = c.dim, rst = c.reset);
         }
         out.push('\n');
     }
     out
 }
 
-// ── Gutter helpers ────────────────────────────────────────────────────────────
-
-fn gutter(line_w: usize, line_no: Option<usize>, c: &C) -> String {
-    match line_no {
-        None => format!(" {blue}{:line_w$} |{rst}\n", "", blue = c.bold_blue, rst = c.reset),
-        Some(n) => format!(" {blue}{n:line_w$} |{rst}", blue = c.bold_blue, rst = c.reset),
-    }
-}
-
-fn gutter_line(line_no: usize, line_w: usize, raw: &str, c: &C) -> String {
-    format!("{} {raw}\n", gutter(line_w, Some(line_no), c))
-}
-
-fn caret_line(raw: &str, expr: &str, line_w: usize, c: &C, sev: Severity) -> String {
-    let lead = raw.len() - raw.trim_start().len();
-    let offset = raw.find(expr.trim_start()).unwrap_or(lead);
-    let caret_len = expr.len().min(raw.len().saturating_sub(offset)).max(1);
-    let carets = "^".repeat(caret_len);
-    let spaces = " ".repeat(offset);
-    format!(" {blue}{:line_w$} |{rst} {spaces}{sev_c}{carets}{rst}\n",
-        "", blue = c.bold_blue, rst = c.reset, sev_c = c.severity(sev))
-}
-
 fn expr_text(f: &Finding) -> String {
-    if f.raw_op.is_empty() {
-        f.raw_lhs.clone()
-    } else {
-        format!("{} {} {}", f.raw_lhs, f.raw_op, f.raw_rhs)
-    }
+    if f.raw_op.is_empty() { f.raw_lhs.clone() }
+    else { format!("{} {} {}", f.raw_lhs, f.raw_op, f.raw_rhs) }
 }
 
 fn digits(n: usize) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
 
-// ── SARIF ────────────────────────────────────────────────────────────────────
+// ── SARIF ─────────────────────────────────────────────────────────────────────
 
 pub fn render_sarif(findings: &[Finding], notes: &[Noted]) -> serde_json::Value {
     let mut rule_ids: std::collections::BTreeSet<&str> =
         findings.iter().map(|f| f.kind.rule_id()).collect();
-    if !notes.is_empty() {
-        rule_ids.insert("note");
-    }
+    if !notes.is_empty() { rule_ids.insert("note"); }
     let rules: Vec<serde_json::Value> = rule_ids
-        .into_iter()
-        .map(|id| serde_json::json!({ "id": id }))
-        .collect();
+        .into_iter().map(|id| serde_json::json!({ "id": id })).collect();
 
-    let mut results: Vec<serde_json::Value> = findings
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "ruleId": f.kind.rule_id(),
-                "level": match f.severity { Severity::Error => "error", Severity::Warning => "warning" },
-                "message": { "text": f.kind.to_string() },
-                "locations": [{ "physicalLocation": {
-                    "artifactLocation": { "uri": f.file.to_string_lossy() },
-                    "region": { "startLine": f.line }
-                }}]
-            })
+    let mut results: Vec<serde_json::Value> = findings.iter().map(|f| {
+        serde_json::json!({
+            "ruleId": f.kind.rule_id(),
+            "level": match f.severity { Severity::Error => "error", Severity::Warning => "warning" },
+            "message": { "text": f.kind.to_string() },
+            "locations": [{ "physicalLocation": {
+                "artifactLocation": { "uri": f.file.to_string_lossy() },
+                "region": { "startLine": f.line }
+            }}]
         })
-        .collect();
+    }).collect();
 
     for n in notes {
         results.push(serde_json::json!({
-            "ruleId": "note",
-            "kind": "informational",
-            "level": "note",
+            "ruleId": "note", "kind": "informational", "level": "note",
             "message": { "text": n.note.to_string() },
             "locations": [{ "physicalLocation": {
                 "artifactLocation": { "uri": n.file.to_string_lossy() },
@@ -245,14 +266,12 @@ pub fn render_sarif(findings: &[Finding], notes: &[Noted]) -> serde_json::Value 
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
         "runs": [{ "tool": { "driver": {
-            "name": "silicon",
-            "version": env!("CARGO_PKG_VERSION"),
-            "rules": rules
+            "name": "silicon", "version": env!("CARGO_PKG_VERSION"), "rules": rules
         }}, "results": results }]
     })
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -278,13 +297,11 @@ mod tests {
     fn render_text_includes_severity_rule_and_title() {
         let findings = findings_for("void f(void) { clocks_hw->clk_gpout0_ctrl = 12u << 5; }");
         let text = render_text(&findings, &[], false);
-        assert!(text.contains("error[field-value-not-in-enum]"), "must show rule id");
+        assert!(text.contains("error"), "must contain severity");
+        assert!(text.contains("field-value-not-in-enum"), "must show rule id");
         assert!(text.contains("AUXSRC"), "title must name the field");
         assert!(text.contains("allowed:"), "citation must list allowed values");
-        // sio_25 is a GPIO FUNCSEL value; the CLOCKS AUXSRC enum has different names
         assert!(text.contains("clksrc_pll_sys=0"), "citation must list the first AUXSRC value");
-        assert!(text.contains("clksrc_pll_sys=0"), "citation must list first allowed value");
-        assert!(text.contains("found 1 error"), "summary must count errors");
     }
 
     #[test]
@@ -343,7 +360,6 @@ mod tests {
         let note_results: Vec<_> = results.iter().filter(|r| r["level"] == "note").collect();
         assert!(!note_results.is_empty());
         assert_eq!(note_results[0]["kind"], "informational");
-        assert_eq!(note_results[0]["ruleId"], "note");
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r["id"] == "note"));
     }

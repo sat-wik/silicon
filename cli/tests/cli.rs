@@ -53,9 +53,9 @@ fn hallucinated_firmware_exits_nonzero_with_cited_finding() {
     let output = run(&[path.to_str().unwrap()]);
     assert_failure(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("error[field-value-not-in-enum]"));
+    assert!(stdout.contains("field-value-not-in-enum"));
     assert!(stdout.contains("CLOCKS.CLK_GPOUT0_CTRL.AUXSRC"));
-    assert!(stdout.contains(":14"));
+    assert!(stdout.contains("14"), "must reference line 14");
 }
 
 #[test]
