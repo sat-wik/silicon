@@ -115,6 +115,15 @@ const HAL_FUNCTIONS: &[&str] = &[
     "pwm_set_enabled",
     // DMA
     "dma_channel_configure", "dma_channel_claim", "dma_channel_unclaim",
+    // UART
+    "uart_init", "uart_deinit", "uart_set_baudrate", "uart_set_format",
+    "uart_set_fifo_enabled", "uart_set_translate_crlf",
+    // SPI
+    "spi_init", "spi_deinit", "spi_set_slave",
+    // I2C
+    "i2c_init", "i2c_deinit", "i2c_set_slave_mode",
+    // ADC
+    "adc_select_input", "adc_gpio_init",
 ];
 
 /// Walks `source` for assignment expressions and extracts every recognized

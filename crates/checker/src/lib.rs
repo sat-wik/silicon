@@ -68,6 +68,13 @@ pub enum FindingKind {
         arg_name: &'static str,
         value: u64,
     },
+    /// A UART/SPI/I2C HAL-call's instance argument (uart0, spi1, etc.) doesn't
+    /// match any peripheral in the SVD — i.e., the device doesn't have that
+    /// many hardware instances.
+    HalCallInstanceNotInSvd {
+        function: String,
+        instance: String,
+    },
 }
 
 /// How confident a finding is. Every variant is already conservative (see
@@ -91,7 +98,8 @@ impl FindingKind {
             | FindingKind::WriteToReadOnlyRegister { .. }
             | FindingKind::HalCallPinOutOfRange { .. }
             | FindingKind::HalCallFuncselNotInEnum { .. }
-            | FindingKind::HalCallIndexOutOfRange { .. } => Severity::Error,
+            | FindingKind::HalCallIndexOutOfRange { .. }
+            | FindingKind::HalCallInstanceNotInSvd { .. } => Severity::Error,
             FindingKind::ValueSetsUndefinedBits { .. } | FindingKind::WriteToReadOnlyField { .. } => {
                 Severity::Warning
             }
@@ -112,6 +120,7 @@ impl FindingKind {
             FindingKind::HalCallPinOutOfRange { .. } => "hal-call-pin-out-of-range",
             FindingKind::HalCallFuncselNotInEnum { .. } => "hal-call-funcsel-not-in-enum",
             FindingKind::HalCallIndexOutOfRange { .. } => "hal-call-index-out-of-range",
+            FindingKind::HalCallInstanceNotInSvd { .. } => "hal-call-instance-not-in-svd",
         }
     }
 
@@ -138,6 +147,8 @@ impl FindingKind {
                 format!("gpio_set_function(GPIO{pin}, {func}) — func not in SVD enum"),
             FindingKind::HalCallIndexOutOfRange { function, arg_name, value } =>
                 format!("{function}({arg_name}={value}) — {arg_name} doesn't correspond to any peripheral instance in the SVD"),
+            FindingKind::HalCallInstanceNotInSvd { function, instance } =>
+                format!("{function}({instance}) — '{instance}' doesn't match any peripheral in the SVD"),
         }
     }
 
@@ -250,6 +261,11 @@ impl std::fmt::Display for FindingKind {
             FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => write!(
                 f,
                 "{function}: {arg_name} value {value} doesn't correspond to any peripheral instance defined in the SVD"
+            ),
+            FindingKind::HalCallInstanceNotInSvd { function, instance } => write!(
+                f,
+                "{function}: '{instance}' doesn't match any peripheral in the SVD — \
+                 check the instance name (e.g. uart0/uart1, spi0/spi1, i2c0/i2c1)"
             ),
         }
     }
@@ -618,12 +634,25 @@ fn check_hal_one(model: &Model, call: &HalCall, result: &mut CheckResult) {
         | "gpio_set_slew_rate" | "gpio_set_drive_strength" | "gpio_set_pulls" => {
             check_gpio_pin_range(call, result)
         }
-        "pwm_set_wrap" | "pwm_set_chan_level" | "pwm_set_clkdiv_int_frac" | "pwm_set_enabled" => {
+        // pwm_set_chan_level also validates the chan arg (0 or 1).
+        "pwm_set_chan_level" => check_pwm_chan_level(model, call, result),
+        "pwm_set_wrap" | "pwm_set_clkdiv_int_frac" | "pwm_set_enabled" => {
             check_pwm_slice_range(model, call, result)
         }
         "dma_channel_configure" | "dma_channel_claim" | "dma_channel_unclaim" => {
             check_dma_channel_range(model, call, result)
         }
+        "uart_init" | "uart_deinit" | "uart_set_baudrate" | "uart_set_format"
+        | "uart_set_fifo_enabled" | "uart_set_translate_crlf" => {
+            check_peripheral_instance(model, call, result)
+        }
+        "spi_init" | "spi_deinit" | "spi_set_slave" => {
+            check_peripheral_instance(model, call, result)
+        }
+        "i2c_init" | "i2c_deinit" | "i2c_set_slave_mode" => {
+            check_peripheral_instance(model, call, result)
+        }
+        "adc_select_input" => check_adc_select_input(model, call, result),
         _ => {}
     }
 }
@@ -672,6 +701,130 @@ fn check_gpio_set_function(model: &Model, call: &HalCall, result: &mut CheckResu
         hal_finding(result, call, FindingKind::HalCallFuncselNotInEnum {
             pin, func, allowed: allowed.clone(),
         });
+    }
+}
+
+/// Validates `pwm_set_chan_level(slice, chan, level)` — checks slice (arg 0)
+/// via SVD register existence and chan (arg 1) by verifying the CC register's
+/// field count for that slice (always 2 on RP2040: channel A and channel B).
+fn check_pwm_chan_level(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    // Slice check (arg 0) — same as check_pwm_slice_range.
+    let slice = match call.args.first() {
+        Some(Some(s)) => *s,
+        Some(None) => {
+            hal_note(result, call, Note::HalCallArgUnknown {
+                function: call.function.clone(), arg_index: 0,
+            });
+            return;
+        }
+        None => return,
+    };
+    if model.register("PWM", &format!("CH{slice}_TOP")).is_none() {
+        hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+            function: call.function.clone(), arg_name: "slice", value: slice,
+        });
+        return;
+    }
+
+    // Chan check (arg 1): valid values are 0 (A) and 1 (B), grounded in the
+    // SVD's CH{slice}_CC register which defines exactly two channel fields.
+    match call.args.get(1) {
+        Some(Some(chan)) => {
+            let cc_reg = model.register("PWM", &format!("CH{slice}_CC"));
+            let n_channels = cc_reg.map(|r| r.fields.len()).unwrap_or(2) as u64;
+            if *chan >= n_channels {
+                hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+                    function: call.function.clone(), arg_name: "chan", value: *chan,
+                });
+            }
+        }
+        Some(None) => hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(), arg_index: 1,
+        }),
+        None => {}
+    }
+}
+
+/// Maps a raw SDK instance identifier to its SVD peripheral name.
+/// "uart0" → "UART0", "spi1" → "SPI1", "i2c0" → "I2C0", etc.
+fn peripheral_from_instance(raw: &str) -> Option<String> {
+    for prefix in &["uart", "spi", "i2c"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            // Require that the suffix is a non-negative integer with no extra chars.
+            if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+                return Some(format!("{}{}", prefix.to_uppercase(), rest));
+            }
+        }
+    }
+    None
+}
+
+/// Validates the peripheral-instance argument (arg 0) of UART, SPI, and I2C
+/// HAL calls. Recognises SDK-standard names (uart0, uart1, spi0 …) and checks
+/// that the corresponding peripheral exists in the SVD.
+fn check_peripheral_instance(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    let raw = match call.raw_args.first() {
+        Some(r) => r.trim().to_string(),
+        None => return,
+    };
+    match peripheral_from_instance(&raw) {
+        Some(periph_name) => {
+            if model.peripheral(&periph_name).is_none() {
+                hal_finding(result, call, FindingKind::HalCallInstanceNotInSvd {
+                    function: call.function.clone(),
+                    instance: raw,
+                });
+            }
+        }
+        // Not a recognisable instance literal — a variable, cast, or macro.
+        // We can't validate it, so emit a note rather than guess.
+        None => hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(), arg_index: 0,
+        }),
+    }
+}
+
+/// Validates `adc_select_input(channel)`.
+/// Grounds the check in the SVD's ADC CS.AINSEL field:
+/// * If the field has enumerated values, the channel must be one of them.
+/// * Otherwise the bit width is the only available bound; values that fit in
+///   3 bits (0–7) but aren't in the datasheet-valid range (0–4) are noted as
+///   unverifiable rather than falsely flagged (invariant 2 / 6).
+fn check_adc_select_input(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    let channel = match call.args.first() {
+        Some(Some(c)) => *c,
+        Some(None) => {
+            return hal_note(result, call, Note::HalCallArgUnknown {
+                function: call.function.clone(), arg_index: 0,
+            })
+        }
+        None => return,
+    };
+
+    let Some(cs_reg) = model.register("ADC", "CS") else { return };
+    let Some(ainsel) = cs_reg.fields.iter().find(|f| f.name == "AINSEL") else { return };
+
+    if let Some(allowed) = &ainsel.allowed_values {
+        // SVD has an enum — check membership.
+        if !allowed.iter().any(|v| v.value == channel) {
+            hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+                function: call.function.clone(),
+                arg_name: "channel",
+                value: channel,
+            });
+        }
+    } else {
+        // No SVD enum: only check if value exceeds the field's bit width.
+        let max = (1u64 << ainsel.bit_width) - 1;
+        if channel > max {
+            hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+                function: call.function.clone(),
+                arg_name: "channel",
+                value: channel,
+            });
+        }
+        // Values that fit in the bit width but may be above the hardware-valid
+        // range (5–7) are not flagged — no SVD enum means unverifiable.
     }
 }
 
@@ -962,6 +1115,158 @@ mod tests {
                 assert_eq!(*value, 12);
             }
             other => panic!("expected HalCallIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    // ── UART / SPI / I2C instance tests ──────────────────────────────────
+
+    #[test]
+    fn uart_init_valid_instance_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { uart_init(uart0, 115200); }");
+        assert!(result.findings.is_empty(), "uart0 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn uart_init_valid_uart1_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { uart_init(uart1, 9600); }");
+        assert!(result.findings.is_empty(), "uart1 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn uart_init_nonexistent_instance_is_flagged() {
+        let model = rp2040_model();
+        // RP2040 only has uart0 and uart1; uart2 doesn't exist in the SVD.
+        let result = hal_check(&model, "void f(void) { uart_init(uart2, 115200); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallInstanceNotInSvd { function, instance } => {
+                assert_eq!(function, "uart_init");
+                assert_eq!(instance, "uart2");
+            }
+            other => panic!("expected HalCallInstanceNotInSvd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spi_init_valid_instance_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { spi_init(spi0, 1000000); }");
+        assert!(result.findings.is_empty(), "spi0 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn spi_init_nonexistent_instance_is_flagged() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { spi_init(spi2, 1000000); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallInstanceNotInSvd { function, instance } => {
+                assert_eq!(function, "spi_init");
+                assert_eq!(instance, "spi2");
+            }
+            other => panic!("expected HalCallInstanceNotInSvd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i2c_init_valid_instance_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { i2c_init(i2c1, 100000); }");
+        assert!(result.findings.is_empty(), "i2c1 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn i2c_init_nonexistent_instance_is_flagged() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { i2c_init(i2c2, 100000); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallInstanceNotInSvd { function, instance } => {
+                assert_eq!(function, "i2c_init");
+                assert_eq!(instance, "i2c2");
+            }
+            other => panic!("expected HalCallInstanceNotInSvd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uart_init_pointer_variable_produces_note_not_finding() {
+        let model = rp2040_model();
+        // Variable — can't statically determine which instance.
+        let result = hal_check(&model, "void f(uart_inst_t *u) { uart_init(u, 115200); }");
+        assert!(result.findings.is_empty());
+        assert!(result.notes.iter().any(|n| matches!(
+            &n.note, Note::HalCallArgUnknown { function, arg_index }
+                if function == "uart_init" && *arg_index == 0
+        )));
+    }
+
+    // ── ADC tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn adc_select_input_valid_channel_passes() {
+        let model = rp2040_model();
+        // Channels 0-7 fit in AINSEL's 3-bit width; SVD has no enum so all
+        // values in range are accepted.
+        let result = hal_check(&model, "void f(void) { adc_select_input(4); }");
+        assert!(result.findings.is_empty(), "channel 4 fits in AINSEL: {:?}", result.findings);
+    }
+
+    #[test]
+    fn adc_select_input_out_of_bitwidth_is_flagged() {
+        let model = rp2040_model();
+        // AINSEL is 3 bits wide (0–7); 8 doesn't fit.
+        let result = hal_check(&model, "void f(void) { adc_select_input(8); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => {
+                assert_eq!(function, "adc_select_input");
+                assert_eq!(*arg_name, "channel");
+                assert_eq!(*value, 8);
+            }
+            other => panic!("expected HalCallIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    // ── PWM chan tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn pwm_set_chan_level_valid_chan_passes() {
+        let model = rp2040_model();
+        // Slice 0, channel 1 (B) — both valid.
+        let result = hal_check(&model, "void f(void) { pwm_set_chan_level(0, 1, 500); }");
+        assert!(result.findings.is_empty(), "slice 0 chan 1 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn pwm_set_chan_level_invalid_chan_is_flagged() {
+        let model = rp2040_model();
+        // RP2040 PWM has only channels 0 (A) and 1 (B); 2 doesn't exist.
+        let result = hal_check(&model, "void f(void) { pwm_set_chan_level(0, 2, 500); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => {
+                assert_eq!(function, "pwm_set_chan_level");
+                assert_eq!(*arg_name, "chan");
+                assert_eq!(*value, 2);
+            }
+            other => panic!("expected HalCallIndexOutOfRange for chan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwm_set_chan_level_invalid_slice_is_flagged_before_chan() {
+        let model = rp2040_model();
+        // Slice 8 is invalid (only 0-7 on RP2040); chan check is skipped.
+        let result = hal_check(&model, "void f(void) { pwm_set_chan_level(8, 0, 500); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallIndexOutOfRange { arg_name, .. } => {
+                assert_eq!(*arg_name, "slice");
+            }
+            other => panic!("expected slice finding, got {other:?}"),
         }
     }
 
