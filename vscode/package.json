@@ -1,0 +1,51 @@
+{
+  "name": "silicon",
+  "displayName": "Silicon — RP2040 Register Verifier",
+  "description": "Inline diagnostics for RP2040 firmware register accesses, grounded in the CMSIS-SVD ground truth.",
+  "version": "0.1.0",
+  "publisher": "silicon",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Linters"],
+  "activationEvents": ["onLanguage:c", "onLanguage:cpp"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "silicon.check",
+        "title": "Silicon: Check File"
+      }
+    ],
+    "configuration": {
+      "title": "Silicon",
+      "properties": {
+        "silicon.executablePath": {
+          "type": "string",
+          "default": "silicon",
+          "description": "Path to the silicon binary. Defaults to 'silicon' on PATH."
+        },
+        "silicon.runOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically re-check the file when it is saved."
+        },
+        "silicon.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra arguments passed to silicon on every run (e.g. ['--scan-headers'])."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

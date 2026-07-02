@@ -1,0 +1,24 @@
+# Example .silicon.toml — rename to .silicon.toml in your firmware project root.
+# All fields are optional; CLI flags always win over config-file values.
+
+# Paths to check (directories are scanned recursively for *.c files).
+paths = ["src", "include"]
+
+# Uncomment to use a custom SVD instead of the vendored RP2040 one.
+# svd = "data/my-chip.svd"
+
+# Report format: "text" (default, human-readable) or "sarif" (machine-readable).
+format = "text"
+
+# Exit non-zero when findings reach or exceed this severity.
+# "error" (default) | "warning" | "none" (always exit 0).
+fail-on = "error"
+
+# Also scan *.h header files.
+scan-headers = false
+
+# Print informational notes about unresolved / unverifiable accesses.
+notes = false
+
+# Write report to a file instead of stdout.
+# output = "silicon.sarif"

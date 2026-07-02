@@ -61,6 +61,13 @@ pub enum FindingKind {
         func: u64,
         allowed: Vec<EnumValue>,
     },
+    /// A HAL-call index argument (PWM slice, DMA channel, etc.) doesn't
+    /// correspond to any peripheral instance defined in the SVD.
+    HalCallIndexOutOfRange {
+        function: String,
+        arg_name: &'static str,
+        value: u64,
+    },
 }
 
 /// How confident a finding is. Every variant is already conservative (see
@@ -83,7 +90,8 @@ impl FindingKind {
             | FindingKind::FieldValueNotInEnum { .. }
             | FindingKind::WriteToReadOnlyRegister { .. }
             | FindingKind::HalCallPinOutOfRange { .. }
-            | FindingKind::HalCallFuncselNotInEnum { .. } => Severity::Error,
+            | FindingKind::HalCallFuncselNotInEnum { .. }
+            | FindingKind::HalCallIndexOutOfRange { .. } => Severity::Error,
             FindingKind::ValueSetsUndefinedBits { .. } | FindingKind::WriteToReadOnlyField { .. } => {
                 Severity::Warning
             }
@@ -103,6 +111,7 @@ impl FindingKind {
             FindingKind::WriteToReadOnlyField { .. } => "write-to-read-only-field",
             FindingKind::HalCallPinOutOfRange { .. } => "hal-call-pin-out-of-range",
             FindingKind::HalCallFuncselNotInEnum { .. } => "hal-call-funcsel-not-in-enum",
+            FindingKind::HalCallIndexOutOfRange { .. } => "hal-call-index-out-of-range",
         }
     }
 
@@ -127,6 +136,8 @@ impl FindingKind {
                 format!("{function}(GPIO{pin}) — pin doesn't exist (RP2040 has GPIO0..GPIO29)"),
             FindingKind::HalCallFuncselNotInEnum { pin, func, .. } =>
                 format!("gpio_set_function(GPIO{pin}, {func}) — func not in SVD enum"),
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } =>
+                format!("{function}({arg_name}={value}) — {arg_name} doesn't correspond to any peripheral instance in the SVD"),
         }
     }
 
@@ -236,6 +247,10 @@ impl std::fmt::Display for FindingKind {
                     "gpio_set_function: func value {func} is not a valid FUNCSEL for GPIO{pin} — SVD IO_BANK0.GPIO{pin}_CTRL.FUNCSEL allows: {allowed_str}"
                 )
             }
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => write!(
+                f,
+                "{function}: {arg_name} value {value} doesn't correspond to any peripheral instance defined in the SVD"
+            ),
         }
     }
 }
@@ -599,7 +614,16 @@ pub fn check_hal_calls(model: &Model, calls: &[HalCall]) -> CheckResult {
 fn check_hal_one(model: &Model, call: &HalCall, result: &mut CheckResult) {
     match call.function.as_str() {
         "gpio_set_function" => check_gpio_set_function(model, call, result),
-        "gpio_init" | "gpio_put" | "gpio_set_dir" => check_gpio_pin_range(call, result),
+        "gpio_init" | "gpio_put" | "gpio_set_dir"
+        | "gpio_set_slew_rate" | "gpio_set_drive_strength" | "gpio_set_pulls" => {
+            check_gpio_pin_range(call, result)
+        }
+        "pwm_set_wrap" | "pwm_set_chan_level" | "pwm_set_clkdiv_int_frac" | "pwm_set_enabled" => {
+            check_pwm_slice_range(model, call, result)
+        }
+        "dma_channel_configure" | "dma_channel_claim" | "dma_channel_unclaim" => {
+            check_dma_channel_range(model, call, result)
+        }
         _ => {}
     }
 }
@@ -648,6 +672,46 @@ fn check_gpio_set_function(model: &Model, call: &HalCall, result: &mut CheckResu
         hal_finding(result, call, FindingKind::HalCallFuncselNotInEnum {
             pin, func, allowed: allowed.clone(),
         });
+    }
+}
+
+fn check_pwm_slice_range(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    match call.args.first() {
+        Some(Some(slice)) => {
+            // Validate against SVD: CH{slice}_TOP must exist in the PWM peripheral.
+            if model.register("PWM", &format!("CH{slice}_TOP")).is_none() {
+                hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+                    function: call.function.clone(),
+                    arg_name: "slice",
+                    value: *slice,
+                });
+            }
+        }
+        Some(None) => hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(),
+            arg_index: 0,
+        }),
+        None => {}
+    }
+}
+
+fn check_dma_channel_range(model: &Model, call: &HalCall, result: &mut CheckResult) {
+    match call.args.first() {
+        Some(Some(channel)) => {
+            // Validate against SVD: CH{channel}_CTRL_TRIG must exist in the DMA peripheral.
+            if model.register("DMA", &format!("CH{channel}_CTRL_TRIG")).is_none() {
+                hal_finding(result, call, FindingKind::HalCallIndexOutOfRange {
+                    function: call.function.clone(),
+                    arg_name: "channel",
+                    value: *channel,
+                });
+            }
+        }
+        Some(None) => hal_note(result, call, Note::HalCallArgUnknown {
+            function: call.function.clone(),
+            arg_index: 0,
+        }),
+        None => {}
     }
 }
 
@@ -855,6 +919,50 @@ mod tests {
         let src = "#define GPIO_FUNC_NULL 31u\nvoid f(void) { gpio_set_function(0, GPIO_FUNC_NULL); }";
         let result = hal_check(&model, src);
         assert!(result.findings.is_empty(), "GPIO_FUNC_NULL=31 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn pwm_set_wrap_valid_slice_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { pwm_set_wrap(7, 1000); }");
+        assert!(result.findings.is_empty(), "slice 7 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn pwm_set_wrap_invalid_slice_is_flagged() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { pwm_set_wrap(8, 1000); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => {
+                assert_eq!(function, "pwm_set_wrap");
+                assert_eq!(*arg_name, "slice");
+                assert_eq!(*value, 8);
+            }
+            other => panic!("expected HalCallIndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dma_channel_configure_valid_channel_passes() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { dma_channel_configure(11, 0, 0, 0, 0, 0); }");
+        assert!(result.findings.is_empty(), "channel 11 is valid: {:?}", result.findings);
+    }
+
+    #[test]
+    fn dma_channel_configure_invalid_channel_is_flagged() {
+        let model = rp2040_model();
+        let result = hal_check(&model, "void f(void) { dma_channel_configure(12, 0, 0, 0, 0, 0); }");
+        assert_eq!(result.findings.len(), 1);
+        match &result.findings[0].kind {
+            FindingKind::HalCallIndexOutOfRange { function, arg_name, value } => {
+                assert_eq!(function, "dma_channel_configure");
+                assert_eq!(*arg_name, "channel");
+                assert_eq!(*value, 12);
+            }
+            other => panic!("expected HalCallIndexOutOfRange, got {other:?}"),
+        }
     }
 
     #[test]

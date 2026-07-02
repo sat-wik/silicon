@@ -106,7 +106,16 @@ pub struct HalCall {
 
 /// SDK function names the Phase B HAL-call tier recognises. Anything else is
 /// simply not extracted — not a finding, not a note, just out of scope.
-const HAL_FUNCTIONS: &[&str] = &["gpio_set_function", "gpio_init", "gpio_put", "gpio_set_dir"];
+const HAL_FUNCTIONS: &[&str] = &[
+    // GPIO
+    "gpio_set_function", "gpio_init", "gpio_put", "gpio_set_dir",
+    "gpio_set_slew_rate", "gpio_set_drive_strength", "gpio_set_pulls",
+    // PWM
+    "pwm_set_wrap", "pwm_set_chan_level", "pwm_set_clkdiv_int_frac",
+    "pwm_set_enabled",
+    // DMA
+    "dma_channel_configure", "dma_channel_claim", "dma_channel_unclaim",
+];
 
 /// Walks `source` for assignment expressions and extracts every recognized
 /// register-access shape. Anything that doesn't match one of the three
@@ -155,6 +164,63 @@ fn build_macro_table(root: Node, src: &[u8]) -> MacroTable {
     let mut table = MacroTable::new();
     collect_macros(root, src, &mut table);
     table
+}
+
+/// Builds a shared macro table from multiple source files (`.c` and `.h`).
+/// Call this first with all project files, then pass the result to
+/// [`extract_accesses_with_macros`] so that a base address `#define`d in a
+/// header is visible when resolving accesses in a translation unit.
+pub fn build_project_macro_table(sources: &[(&str, &Path)]) -> HashMap<String, u64> {
+    let mut table = MacroTable::new();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .expect("tree-sitter-c grammar must load");
+    for (source, _path) in sources {
+        if let Some(tree) = parser.parse(source, None) {
+            collect_macros(tree.root_node(), source.as_bytes(), &mut table);
+        }
+    }
+    table
+}
+
+/// Like [`extract_accesses`] but uses a pre-built macro table (e.g. from
+/// [`build_project_macro_table`]) instead of building one from this file alone.
+pub fn extract_accesses_with_macros(
+    source: &str,
+    file: &Path,
+    macros: &HashMap<String, u64>,
+) -> Vec<RegisterAccess> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .expect("tree-sitter-c grammar must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), bytes, file, macros, &mut out);
+    out
+}
+
+/// Like [`extract_hal_calls`] but uses a pre-built macro table.
+pub fn extract_hal_calls_with_macros(
+    source: &str,
+    file: &Path,
+    macros: &HashMap<String, u64>,
+) -> Vec<HalCall> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .expect("tree-sitter-c grammar must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    walk_hal(tree.root_node(), bytes, file, macros, &mut out);
+    out
 }
 
 fn collect_macros(node: Node, src: &[u8], table: &mut MacroTable) {
